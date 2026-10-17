@@ -482,18 +482,44 @@ jobs:
             "uninstaller_exit_code=$($uninstall.ExitCode)" | Add-Content -LiteralPath $log -Encoding utf8
             if ($uninstall.ExitCode -ne 0) { throw "فشلت إزالة التثبيت برمز $($uninstall.ExitCode)." }
             if (Test-Path -LiteralPath (Join-Path $installDir "SDFBranchSystem.exe")) { throw "بقي الملف التنفيذي بعد إزالة التثبيت." }
-            $programs = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"
+            
+            $programRoots = @(
+            (Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"),
+            (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
+            )
+
             $shell = New-Object -ComObject WScript.Shell
-            foreach ($shortcutFile in @(Get-ChildItem -LiteralPath $programs -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue)) {
-              try {
-                $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
-                if ($shortcut.TargetPath -and ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq [System.IO.Path]::GetFullPath((Join-Path $installDir "SDFBranchSystem.exe")))) {
-                  throw "بقي اختصار قائمة ابدأ بعد إزالة التثبيت: $($shortcutFile.FullName)"
-                }
-              } catch {
-                if ($_.Exception.Message -like "بقي اختصار قائمة ابدأ*") { throw }
-              }
+            $installedExe = Join-Path $installDir "SDFBranchSystem.exe"
+
+            foreach ($programRoot in $programRoots) {
+            if (-not (Test-Path -LiteralPath $programRoot -PathType Container)) {
+            continue
             }
+
+            $shortcuts = @(
+            Get-ChildItem -LiteralPath $programRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue
+           )
+
+           foreach ($shortcutFile in $shortcuts) {
+           try {
+            $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
+
+            if (
+                $shortcut.TargetPath -and
+                ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq
+                 [System.IO.Path]::GetFullPath($installedExe))
+            ) {
+                throw "بقي اختصار قائمة ابدأ بعد إزالة التثبيت: $($shortcutFile.FullName)"
+            }
+            }
+            catch {
+            if ($_.Exception.Message -like "بقي اختصار قائمة ابدأ*") {
+                throw
+            }
+            }
+            }
+            }
+
             $uninstallSucceeded = $true
           } else {
             "uninstaller=not_found; uninstall check failed" | Add-Content -LiteralPath $log -Encoding utf8
