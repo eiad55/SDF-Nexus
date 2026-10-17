@@ -379,17 +379,51 @@ jobs:
           $exe = Join-Path $installDir "SDFBranchSystem.exe"
           if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "الملف التنفيذي غير موجود بعد التثبيت: $exe" }
 
-          $programs = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"
-          $shortcuts = @(Get-ChildItem -LiteralPath $programs -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue)
+         
+          $programRoots = @(
+          (Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"),
+          (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
+          )
+
           $shell = New-Object -ComObject WScript.Shell
           $matchingShortcut = $false
-          foreach ($shortcutFile in $shortcuts) {
-            try {
-              $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
-              if ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq [System.IO.Path]::GetFullPath($exe)) { $matchingShortcut = $true; break }
-            } catch { }
+
+          foreach ($programRoot in $programRoots) {
+          if (-not (Test-Path -LiteralPath $programRoot -PathType Container)) {
+          continue
           }
-          if (-not $matchingShortcut) { throw "لم يُعثر على اختصار قائمة ابدأ يشير إلى الملف التنفيذي المثبت." }
+
+          $shortcuts = @(
+          Get-ChildItem -LiteralPath $programRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue
+          )
+
+          foreach ($shortcutFile in $shortcuts) {
+          try {
+            $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
+
+            if (
+                $shortcut.TargetPath -and
+                ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq
+                 [System.IO.Path]::GetFullPath($exe))
+            ) {
+                $matchingShortcut = $true
+                break
+            }
+            }
+           catch {
+            # تجاهل الاختصار الذي يتعذر قراءته.
+          }
+          }
+
+          if ($matchingShortcut) {
+          break
+          }
+          }
+
+          if (-not $matchingShortcut) {
+          throw "لم يُعثر على اختصار قائمة ابدأ يشير إلى الملف التنفيذي المثبت في مساري المستخدم والنظام."
+          }
+
 
           Remove-Item Env:SDF_DATA_DIR -ErrorAction SilentlyContinue
           $process = Start-Process -FilePath $exe -PassThru
