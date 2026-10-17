@@ -170,6 +170,7 @@ jobs:
       - name: تشغيل الاختبارات
         shell: pwsh
         run: |
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg"
           python -m pytest sdf_pkg/tests/ -q --junitxml=sdf_pkg/ci-logs/junit.xml 2>&1 | Tee-Object -FilePath "sdf_pkg/ci-logs/pytest.log"
           $testExitCode = $LASTEXITCODE
           "pytest_exit_code=$testExitCode" | Set-Content -Path "sdf_pkg/ci-logs/pytest-exit-code.txt" -Encoding utf8
