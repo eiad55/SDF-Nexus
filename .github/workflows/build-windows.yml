@@ -434,7 +434,7 @@ jobs:
           try {
             $shortcutResolution = Resolve-LnkTarget $shortcutFile.FullName
             if (Test-LnkTargetEquals $shortcutResolution.Target $exe) {
-                $shortcutResolution = Resolve-LnkTarget $shortcutFile.FullName
+                $matchingShortcut = $true
                 (Format-LnkResolution $shortcutFile.FullName $shortcutResolution) | Add-Content -LiteralPath $log -Encoding utf8
                 "shortcut_match=$($shortcutFile.FullName) method=$($shortcutResolution.Method)" | Add-Content -LiteralPath $log -Encoding utf8
                 break
