@@ -356,6 +356,14 @@ jobs:
           name: SDFBranchSystem-SHA256-${{ needs.build.outputs.version }}
           path: ${{ runner.temp }}/sdf-checksums
 
+      - name: اختبار محلّل اختصارات Shell Link (تركيبات اصطناعية)
+        shell: pwsh
+        run: |
+          $parserScript = Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tools/test_lnk_parser.ps1"
+          $fixturesDir = Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tests/fixtures/lnk"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File $parserScript -FixturesDir $fixturesDir 2>&1 | Tee-Object -FilePath "ci-logs/lnk-parser-fixtures.log" -Append
+          if ($LASTEXITCODE -ne 0) { throw "فشل اختبار محلّل اختصارات Shell Link على التركيبات الاصطناعية." }
+
       - name: تثبيت البرنامج والتحقق من التشغيل وقاعدة البيانات
         shell: pwsh
         run: |
@@ -386,7 +394,8 @@ jobs:
           (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
           )
 
-          $shell = New-Object -ComObject WScript.Shell
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          . (Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tools/lnk_shortcut.ps1")
           $matchingShortcut = $false
 
           foreach ($programRoot in $programRoots) {
@@ -400,17 +409,14 @@ jobs:
 
           foreach ($shortcutFile in $shortcuts) {
           try {
-            $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
-
-            if (
-                $shortcut.TargetPath -and
-                ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq
-                 [System.IO.Path]::GetFullPath($exe))
-            ) {
-                $matchingShortcut = $true
+            $shortcutResolution = Resolve-LnkTarget $shortcutFile.FullName
+            if (Test-LnkTargetEquals $shortcutResolution.Target $exe) {
+                $shortcutResolution = Resolve-LnkTarget $shortcutFile.FullName
+                (Format-LnkResolution $shortcutFile.FullName $shortcutResolution) | Add-Content -LiteralPath $log -Encoding utf8
+                "shortcut_match=$($shortcutFile.FullName) method=$($shortcutResolution.Method)" | Add-Content -LiteralPath $log -Encoding utf8
                 break
             }
-            }
+             }
            catch {
             # تجاهل الاختصار الذي يتعذر قراءته.
           }
@@ -429,9 +435,13 @@ jobs:
             "shortcut_diag_root=$diagRoot exists=$(Test-Path -LiteralPath $diagRoot -PathType Container)" | Add-Content -LiteralPath $log -Encoding utf8
             if (Test-Path -LiteralPath $diagRoot -PathType Container) {
               foreach ($diagFile in @(Get-ChildItem -LiteralPath $diagRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue)) {
-                $diagTarget = ""
-                try { $diagTarget = $shell.CreateShortcut($diagFile.FullName).TargetPath } catch { $diagTarget = "<unreadable>" }
-                "shortcut_diag_found=$($diagFile.FullName) target=$diagTarget" | Add-Content -LiteralPath $log -Encoding utf8
+                $diagResolution = Resolve-LnkTarget $diagFile.FullName
+                "shortcut_diag_found=$($diagFile.FullName)" | Add-Content -LiteralPath $log -Encoding utf8
+                (Format-LnkResolution $diagFile.FullName $diagResolution) | Add-Content -LiteralPath $log -Encoding utf8
+                if ($diagResolution.Parsed -and $diagResolution.Parsed.StringData -and $diagResolution.Parsed.StringData.Count -gt 0) {
+                  $sd = $diagResolution.Parsed.StringData
+                  "shortcut_stringdata path=$($diagFile.FullName) name=[$($sd['name'])] relative_path=[$($sd['relative_path'])] working_dir=[$($sd['working_dir'])] icon_location=[$($sd['icon_location'])]" | Add-Content -LiteralPath $log -Encoding utf8
+                }
               }
             }
           }
@@ -503,8 +513,10 @@ jobs:
             (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
             )
 
-            $shell = New-Object -ComObject WScript.Shell
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            . (Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tools/lnk_shortcut.ps1")
             $installedExe = Join-Path $installDir "SDFBranchSystem.exe"
+            $expectedStartMenuLnk = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/نظام إدارة ومراجعة ملفات البرامج التدريبية/نظام إدارة ومراجعة ملفات البرامج التدريبية.lnk"
 
             foreach ($programRoot in $programRoots) {
             if (-not (Test-Path -LiteralPath $programRoot -PathType Container)) {
@@ -517,13 +529,7 @@ jobs:
 
            foreach ($shortcutFile in $shortcuts) {
            try {
-            $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
-
-            if (
-                $shortcut.TargetPath -and
-                ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq
-                 [System.IO.Path]::GetFullPath($installedExe))
-            ) {
+            if ((Test-LnkTargetEquals (Resolve-LnkTarget $shortcutFile.FullName).Target $installedExe) -or ($shortcutFile.FullName -ieq $expectedStartMenuLnk)) {
                 throw "بقي اختصار قائمة ابدأ بعد إزالة التثبيت: $($shortcutFile.FullName)"
             }
             }
