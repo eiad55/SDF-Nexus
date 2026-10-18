@@ -275,6 +275,23 @@ jobs:
           "content_secret_scan_exit_code=$scanExitCode" | Set-Content -Path "sdf_pkg/ci-logs/content-secret-scan-exit-code.txt" -Encoding utf8
           if ($scanExitCode -ne 0) { throw "فشل فحص محتوى artifacts؛ لن تُرفع المخرجات." }
 
+      - name: تجهيز أدوات فحص الاختصارات لوظيفة install-smoke
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "lnk-tools/tools" | Out-Null
+          New-Item -ItemType Directory -Force -Path "lnk-tools/tests/fixtures" | Out-Null
+          Copy-Item -LiteralPath "sdf_pkg/tools/lnk_shortcut.ps1" -Destination "lnk-tools/tools/"
+          Copy-Item -LiteralPath "sdf_pkg/tools/test_lnk_parser.ps1" -Destination "lnk-tools/tools/"
+          Copy-Item -LiteralPath "sdf_pkg/tests/fixtures/lnk" -Destination "lnk-tools/tests/fixtures/" -Recurse
+
+      - name: رفع أدوات فحص الاختصارات
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-LnkTools-${{ github.run_id }}
+          path: lnk-tools
+          if-no-files-found: error
+          retention-days: 14
+
       - name: رفع بيان البصمات
         uses: actions/upload-artifact@v4
         with:
@@ -356,6 +373,20 @@ jobs:
           name: SDFBranchSystem-SHA256-${{ needs.build.outputs.version }}
           path: ${{ runner.temp }}/sdf-checksums
 
+      - name: تنزيل أدوات فحص الاختصارات
+        uses: actions/download-artifact@v4
+        with:
+          name: SDFBranchSystem-LnkTools-${{ github.run_id }}
+          path: ${{ runner.temp }}/sdf-lnk-tools
+
+      - name: اختبار محلّل اختصارات Shell Link (تركيبات اصطناعية)
+        shell: pwsh
+        run: |
+          $parserScript = Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/test_lnk_parser.ps1"
+          $fixturesDir = Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tests/fixtures/lnk"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File $parserScript -FixturesDir $fixturesDir 2>&1 | Tee-Object -FilePath "ci-logs/lnk-parser-fixtures.log" -Append
+          if ($LASTEXITCODE -ne 0) { throw "فشل اختبار محلّل اختصارات Shell Link على التركيبات الاصطناعية." }
+
       - name: تثبيت البرنامج والتحقق من التشغيل وقاعدة البيانات
         shell: pwsh
         run: |
@@ -373,7 +404,8 @@ jobs:
           $actualHash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualHash -ne $expectedHash) { throw "فشل التحقق من SHA-256 للمثبت قبل التشغيل." }
           "installer_sha256_verified=$actualHash" | Add-Content -LiteralPath $log -Encoding utf8
-          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/DIR=`"{0}`"" -f $installDir)) -Wait -PassThru
+          $installerLog = Join-Path $env:GITHUB_WORKSPACE "ci-logs/installer-inno.log"
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/LOG=`"{0}`"" -f $installerLog),("/DIR=`"{0}`"" -f $installDir)) -Wait -PassThru
           "installer_exit_code=$($install.ExitCode)" | Tee-Object -FilePath $log -Append
           if ($install.ExitCode -ne 0) { throw "فشل التثبيت الصامت برمز $($install.ExitCode)." }
           $exe = Join-Path $installDir "SDFBranchSystem.exe"
@@ -385,7 +417,8 @@ jobs:
           (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
           )
 
-          $shell = New-Object -ComObject WScript.Shell
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          . (Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/lnk_shortcut.ps1")
           $matchingShortcut = $false
 
           foreach ($programRoot in $programRoots) {
@@ -399,17 +432,14 @@ jobs:
 
           foreach ($shortcutFile in $shortcuts) {
           try {
-            $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
-
-            if (
-                $shortcut.TargetPath -and
-                ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq
-                 [System.IO.Path]::GetFullPath($exe))
-            ) {
+            $shortcutResolution = Resolve-LnkTarget $shortcutFile.FullName
+            if (Test-LnkTargetEquals $shortcutResolution.Target $exe) {
                 $matchingShortcut = $true
+                (Format-LnkResolution $shortcutFile.FullName $shortcutResolution) | Add-Content -LiteralPath $log -Encoding utf8
+                "shortcut_match=$($shortcutFile.FullName) method=$($shortcutResolution.Method)" | Add-Content -LiteralPath $log -Encoding utf8
                 break
             }
-            }
+             }
            catch {
             # تجاهل الاختصار الذي يتعذر قراءته.
           }
@@ -421,6 +451,23 @@ jobs:
           }
 
           if (-not $matchingShortcut) {
+          # تشخيص قبل الفشل: سجّل الاختصارات الموجودة فعليًا وأهدافها، حتى يُفرَّق في سجل واحد
+          # بين اختصار لم يُنشأ، واختصار خارج المسارين المفحوصين، واختلاف في الهدف.
+          "shortcut_diag_expected_exe=$exe" | Add-Content -LiteralPath $log -Encoding utf8
+          foreach ($diagRoot in $programRoots) {
+            "shortcut_diag_root=$diagRoot exists=$(Test-Path -LiteralPath $diagRoot -PathType Container)" | Add-Content -LiteralPath $log -Encoding utf8
+            if (Test-Path -LiteralPath $diagRoot -PathType Container) {
+              foreach ($diagFile in @(Get-ChildItem -LiteralPath $diagRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue)) {
+                $diagResolution = Resolve-LnkTarget $diagFile.FullName
+                "shortcut_diag_found=$($diagFile.FullName)" | Add-Content -LiteralPath $log -Encoding utf8
+                (Format-LnkResolution $diagFile.FullName $diagResolution) | Add-Content -LiteralPath $log -Encoding utf8
+                if ($diagResolution.Parsed -and $diagResolution.Parsed.StringData -and $diagResolution.Parsed.StringData.Count -gt 0) {
+                  $sd = $diagResolution.Parsed.StringData
+                  "shortcut_stringdata path=$($diagFile.FullName) name=[$($sd['name'])] relative_path=[$($sd['relative_path'])] working_dir=[$($sd['working_dir'])] icon_location=[$($sd['icon_location'])]" | Add-Content -LiteralPath $log -Encoding utf8
+                }
+              }
+            }
+          }
           throw "لم يُعثر على اختصار قائمة ابدأ يشير إلى الملف التنفيذي المثبت في مساري المستخدم والنظام."
           }
 
@@ -478,7 +525,8 @@ jobs:
           $uninstaller = Join-Path $installDir "unins000.exe"
           $uninstallSucceeded = $false
           if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
-            $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART') -Wait -PassThru
+            $uninstallerLog = Join-Path $env:GITHUB_WORKSPACE "ci-logs/uninstaller-inno.log"
+            $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/LOG=`"{0}`"" -f $uninstallerLog)) -Wait -PassThru
             "uninstaller_exit_code=$($uninstall.ExitCode)" | Add-Content -LiteralPath $log -Encoding utf8
             if ($uninstall.ExitCode -ne 0) { throw "فشلت إزالة التثبيت برمز $($uninstall.ExitCode)." }
             if (Test-Path -LiteralPath (Join-Path $installDir "SDFBranchSystem.exe")) { throw "بقي الملف التنفيذي بعد إزالة التثبيت." }
@@ -488,8 +536,10 @@ jobs:
             (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
             )
 
-            $shell = New-Object -ComObject WScript.Shell
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            . (Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/lnk_shortcut.ps1")
             $installedExe = Join-Path $installDir "SDFBranchSystem.exe"
+            $expectedStartMenuLnk = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/نظام إدارة ومراجعة ملفات البرامج التدريبية/نظام إدارة ومراجعة ملفات البرامج التدريبية.lnk"
 
             foreach ($programRoot in $programRoots) {
             if (-not (Test-Path -LiteralPath $programRoot -PathType Container)) {
@@ -502,13 +552,7 @@ jobs:
 
            foreach ($shortcutFile in $shortcuts) {
            try {
-            $shortcut = $shell.CreateShortcut($shortcutFile.FullName)
-
-            if (
-                $shortcut.TargetPath -and
-                ([System.IO.Path]::GetFullPath($shortcut.TargetPath) -ieq
-                 [System.IO.Path]::GetFullPath($installedExe))
-            ) {
+            if ((Test-LnkTargetEquals (Resolve-LnkTarget $shortcutFile.FullName).Target $installedExe) -or ($shortcutFile.FullName -ieq $expectedStartMenuLnk)) {
                 throw "بقي اختصار قائمة ابدأ بعد إزالة التثبيت: $($shortcutFile.FullName)"
             }
             }
@@ -536,6 +580,7 @@ jobs:
             "install_smoke=0" | Set-Content -Path $statusFile -Encoding utf8
           } else {
             "data_retained_after_uninstall=$([bool](Test-Path -LiteralPath $db -PathType Leaf)); prior_status=$priorStatus" | Add-Content -LiteralPath $log -Encoding utf8
+            "data_retained_detail=db_exists=$([bool](Test-Path -LiteralPath $db -PathType Leaf)); db_integrity_ok=$dbIntegrityOk; uninstall_succeeded=$uninstallSucceeded; prior_status=$priorStatus" | Add-Content -LiteralPath $log -Encoding utf8
             "install_smoke=1" | Set-Content -Path $statusFile -Encoding utf8
             if ($priorStatus -ne "checks_passed_uninstall_pending") { throw "لم تكتمل فحوصات التثبيت والتشغيل قبل مرحلة الإزالة؛ راجع install-smoke.log." }
             throw "قاعدة بيانات المستخدم لم تبقَ بعد إزالة التثبيت."
