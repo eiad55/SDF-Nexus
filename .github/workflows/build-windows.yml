@@ -275,6 +275,23 @@ jobs:
           "content_secret_scan_exit_code=$scanExitCode" | Set-Content -Path "sdf_pkg/ci-logs/content-secret-scan-exit-code.txt" -Encoding utf8
           if ($scanExitCode -ne 0) { throw "فشل فحص محتوى artifacts؛ لن تُرفع المخرجات." }
 
+      - name: تجهيز أدوات فحص الاختصارات لوظيفة install-smoke
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "lnk-tools/tools" | Out-Null
+          New-Item -ItemType Directory -Force -Path "lnk-tools/tests/fixtures" | Out-Null
+          Copy-Item -LiteralPath "sdf_pkg/tools/lnk_shortcut.ps1" -Destination "lnk-tools/tools/"
+          Copy-Item -LiteralPath "sdf_pkg/tools/test_lnk_parser.ps1" -Destination "lnk-tools/tools/"
+          Copy-Item -LiteralPath "sdf_pkg/tests/fixtures/lnk" -Destination "lnk-tools/tests/fixtures/" -Recurse
+
+      - name: رفع أدوات فحص الاختصارات
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-LnkTools-${{ github.run_id }}
+          path: lnk-tools
+          if-no-files-found: error
+          retention-days: 14
+
       - name: رفع بيان البصمات
         uses: actions/upload-artifact@v4
         with:
@@ -356,11 +373,17 @@ jobs:
           name: SDFBranchSystem-SHA256-${{ needs.build.outputs.version }}
           path: ${{ runner.temp }}/sdf-checksums
 
+      - name: تنزيل أدوات فحص الاختصارات
+        uses: actions/download-artifact@v4
+        with:
+          name: SDFBranchSystem-LnkTools-${{ github.run_id }}
+          path: ${{ runner.temp }}/sdf-lnk-tools
+
       - name: اختبار محلّل اختصارات Shell Link (تركيبات اصطناعية)
         shell: pwsh
         run: |
-          $parserScript = Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tools/test_lnk_parser.ps1"
-          $fixturesDir = Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tests/fixtures/lnk"
+          $parserScript = Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/test_lnk_parser.ps1"
+          $fixturesDir = Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tests/fixtures/lnk"
           pwsh -NoProfile -ExecutionPolicy Bypass -File $parserScript -FixturesDir $fixturesDir 2>&1 | Tee-Object -FilePath "ci-logs/lnk-parser-fixtures.log" -Append
           if ($LASTEXITCODE -ne 0) { throw "فشل اختبار محلّل اختصارات Shell Link على التركيبات الاصطناعية." }
 
@@ -395,7 +418,7 @@ jobs:
           )
 
           Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-          . (Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tools/lnk_shortcut.ps1")
+          . (Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/lnk_shortcut.ps1")
           $matchingShortcut = $false
 
           foreach ($programRoot in $programRoots) {
@@ -514,7 +537,7 @@ jobs:
             )
 
             Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
-            . (Join-Path $env:RUNNER_TEMP "sdf-source/sdf_pkg/tools/lnk_shortcut.ps1")
+            . (Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/lnk_shortcut.ps1")
             $installedExe = Join-Path $installDir "SDFBranchSystem.exe"
             $expectedStartMenuLnk = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/نظام إدارة ومراجعة ملفات البرامج التدريبية/نظام إدارة ومراجعة ملفات البرامج التدريبية.lnk"
 
