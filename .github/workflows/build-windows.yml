@@ -1,0 +1,616 @@
+name: بناء نسخة Windows
+
+"on":
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.set_version.outputs.version }}
+    steps:
+      - name: جلب المستودع
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: إعداد Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: SDFBranchSystem-source.zip
+
+      - name: التحقق من حزمة المصدر وفكها
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zipPath = Join-Path $env:GITHUB_WORKSPACE "SDFBranchSystem-source.zip"
+          if (-not (Test-Path -LiteralPath $zipPath -PathType Leaf)) {
+            throw "ملف SDFBranchSystem-source.zip غير موجود في جذر المستودع."
+          }
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $zipInfo = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+          try {
+            $requiredEntries = @(
+              "sdf_pkg/requirements.txt",
+              "sdf_pkg/requirements-dev.txt",
+              "sdf_pkg/tests/conftest.py",
+              "sdf_pkg/build/SDFBranchSystem.spec",
+              "sdf_pkg/build/setup.iss",
+              "sdf_pkg/src/sdf_app/config.py",
+              "sdf_pkg/src/sdf_app/__init__.py"
+            )
+            $entryNames = @($zipInfo.Entries | ForEach-Object { $_.FullName })
+            foreach ($entry in $requiredEntries) {
+              if ($entryNames -notcontains $entry) {
+                throw "عنصر مطلوب غير موجود داخل ZIP: $entry"
+              }
+            }
+            if ($entryNames -contains "sdf_pkg/.github/workflows/build-windows.yml") {
+              throw "الـ Workflow موجود بنسخة مكررة داخل المصدر؛ يجب إبقاؤه في جذر المستودع فقط."
+            }
+          }
+          finally {
+            $zipInfo.Dispose()
+          }
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $env:GITHUB_WORKSPACE -Force
+          $requiredPaths = @(
+            "sdf_pkg/requirements-dev.txt",
+            "sdf_pkg/tests",
+            "sdf_pkg/build/SDFBranchSystem.spec",
+            "sdf_pkg/build/setup.iss",
+            "sdf_pkg/src/sdf_app/config.py",
+            "sdf_pkg/src/sdf_app/__init__.py"
+          )
+          foreach ($item in $requiredPaths) {
+            if (-not (Test-Path -LiteralPath (Join-Path $env:GITHUB_WORKSPACE $item))) {
+              throw "عنصر مطلوب غير موجود بعد فك الحزمة: $item"
+            }
+          }
+
+      - name: توحيد إصدار التطبيق والمثبت
+        id: set_version
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $root = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg"
+          $configPath = Join-Path $root "src/sdf_app/config.py"
+          $initPath = Join-Path $root "src/sdf_app/__init__.py"
+          $setupPath = Join-Path $root "build/setup.iss"
+          $configText = Get-Content -LiteralPath $configPath -Raw
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            if ($env:GITHUB_REF_NAME -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
+              throw "وسم الإصدار غير صالح. استخدم vMAJOR.MINOR.PATCH مثل v1.2.3."
+            }
+            $version = $Matches.version
+          }
+          else {
+            if ($configText -notmatch '(?m)^VERSION = "(?<version>\d+\.\d+\.\d+)"[ \t]*$') {
+              throw "تعذر استخراج الإصدار الأساسي من config.py."
+            }
+            $version = $Matches.version
+          }
+          $targets = @(
+            @{ Path = $configPath; Pattern = '(?m)^VERSION = "\d+\.\d+\.\d+"[ \t]*$'; Replacement = 'VERSION = "' + $version + '"' },
+            @{ Path = $initPath; Pattern = '(?m)^__version__ = "\d+\.\d+\.\d+"[ \t]*$'; Replacement = '__version__ = "' + $version + '"' },
+            @{ Path = $setupPath; Pattern = '(?m)^#define MyAppVersion "\d+\.\d+\.\d+"[ \t]*$'; Replacement = '#define MyAppVersion "' + $version + '"' }
+          )
+          foreach ($target in $targets) {
+            $content = Get-Content -LiteralPath $target.Path -Raw
+            $matches = [regex]::Matches($content, $target.Pattern)
+            if ($matches.Count -ne 1) {
+              throw "يجب أن يظهر تعريف الإصدار مرة واحدة بالضبط في: $($target.Path)"
+            }
+            $updated = [regex]::Replace($content, $target.Pattern, $target.Replacement)
+            Set-Content -LiteralPath $target.Path -Value $updated -Encoding utf8NoBOM
+          }
+          "SDF_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "إصدار التطبيق والمثبت: $version"
+
+      - name: تثبيت المتطلبات
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "فشل تحديث pip." }
+          python -m pip install -r sdf_pkg/requirements-dev.txt
+          if ($LASTEXITCODE -ne 0) { throw "فشل تثبيت متطلبات المشروع والاختبارات." }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { throw "يوجد تعارض في تبعيات Python." }
+
+      - name: تدقيق الاعتماديات وإنشاء SBOM
+        shell: pwsh
+        run: |
+          python -m pip install pip-audit
+          if ($LASTEXITCODE -ne 0) { throw "فشل تثبيت pip-audit." }
+          New-Item -ItemType Directory -Force -Path "sdf_pkg/ci-logs" | Out-Null
+          pip-audit --format cyclonedx-json --output "sdf_pkg/ci-logs/sbom.cdx.json" 2>&1 | Tee-Object -FilePath "sdf_pkg/ci-logs/pip-audit.log"
+          $auditExitCode = $LASTEXITCODE
+          "pip_audit_exit_code=$auditExitCode" | Set-Content -Path "sdf_pkg/ci-logs/pip-audit-exit-code.txt" -Encoding utf8
+          if ($auditExitCode -ne 0) { throw "فشل تدقيق الاعتماديات أو عُثر على ثغرات؛ راجع pip-audit.log." }
+          if (-not (Test-Path -LiteralPath "sdf_pkg/ci-logs/sbom.cdx.json" -PathType Leaf)) { throw "لم يُنشأ SBOM بصيغة CycloneDX." }
+
+      - name: تجهيز سجلات التشخيص
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "sdf_pkg/ci-logs" | Out-Null
+          "not_run" | Set-Content -Path "sdf_pkg/ci-logs/pytest-exit-code.txt" -Encoding utf8
+          "pyinstaller=not_run`ninno_setup=not_run" | Set-Content -Path "sdf_pkg/ci-logs/process-exit-codes.txt" -Encoding utf8
+          @(
+            "UTC: $([DateTime]::UtcNow.ToString('o'))",
+            "Runner OS: $env:RUNNER_OS",
+            "Python:",
+            (python --version 2>&1 | Out-String),
+            "Pip:",
+            (python -m pip --version 2>&1 | Out-String),
+            "Git ref: $env:GITHUB_REF",
+            "Commit: $env:GITHUB_SHA"
+          ) | Set-Content -Path "sdf_pkg/ci-logs/environment.txt" -Encoding utf8
+          python -m pip freeze | Set-Content -Path "sdf_pkg/ci-logs/pip-freeze.txt" -Encoding utf8
+
+      - name: فحص صياغة Python
+        shell: pwsh
+        run: |
+          python -m compileall -q sdf_pkg/src sdf_pkg/tests 2>&1 | Tee-Object -FilePath "sdf_pkg/ci-logs/compileall.log"
+          if ($LASTEXITCODE -ne 0) { throw "فشل فحص صياغة ملفات Python." }
+
+      - name: تشغيل الاختبارات
+        shell: pwsh
+        run: |
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg"
+          python -m pytest sdf_pkg/tests/ -q --junitxml=sdf_pkg/ci-logs/junit.xml 2>&1 | Tee-Object -FilePath "sdf_pkg/ci-logs/pytest.log"
+          $testExitCode = $LASTEXITCODE
+          "pytest_exit_code=$testExitCode" | Set-Content -Path "sdf_pkg/ci-logs/pytest-exit-code.txt" -Encoding utf8
+          if ($testExitCode -ne 0) { throw "فشلت الاختبارات برمز خروج $testExitCode؛ أُوقف البناء مع حفظ السجل." }
+
+      - name: مسبار تصيير Windows (تشخيص قص الحروف)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg/src"
+          $env:QT_QPA_PLATFORM = "windows"
+          foreach ($f in @("1.0", "1.25", "1.5")) {
+            $env:QT_SCALE_FACTOR = $f
+            python sdf_pkg/tools/render_probe.py sdf_pkg/render-probe 2>&1 | Tee-Object -FilePath "sdf_pkg/render-probe/log_$f.txt" -Append
+          }
+
+      - name: رفع صور المسبار
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-RenderProbe-${{ github.run_id }}
+          path: sdf_pkg/render-probe
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: بناء النسخة المحمولة
+        shell: pwsh
+        working-directory: sdf_pkg
+        run: |
+          python -m PyInstaller --clean --noconfirm build/SDFBranchSystem.spec 2>&1 | Tee-Object -FilePath "ci-logs/pyinstaller.log"
+          $buildExitCode = $LASTEXITCODE
+          "pyinstaller=$buildExitCode" | Add-Content -Path "ci-logs/process-exit-codes.txt" -Encoding utf8
+          if ($buildExitCode -ne 0) { throw "فشل PyInstaller برمز خروج $buildExitCode." }
+          $portable = "dist/SDFBranchSystem"
+          $exe = Join-Path $portable "SDFBranchSystem.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
+            throw "لم يُنتج PyInstaller الملف التنفيذي المتوقع."
+          }
+          $files = @(Get-ChildItem -LiteralPath $portable -Recurse -File)
+          if ($files.Count -lt 2) {
+            throw "مجلد النسخة المحمولة لا يحتوي على ملفات كافية؛ راجع ناتج PyInstaller."
+          }
+
+      - name: تثبيت Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "فشل تثبيت Inno Setup." }
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path -LiteralPath $iscc -PathType Leaf)) {
+            throw "لم يُعثر على ISCC.exe في المسار المتوقع بعد التثبيت."
+          }
+
+      - name: بناء المثبت والتحقق منه
+        shell: pwsh
+        working-directory: sdf_pkg
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" build/setup.iss 2>&1 | Tee-Object -FilePath "ci-logs/inno-setup.log"
+          $installerExitCode = $LASTEXITCODE
+          "inno_setup=$installerExitCode" | Add-Content -Path "ci-logs/process-exit-codes.txt" -Encoding utf8
+          if ($installerExitCode -ne 0) { throw "فشل بناء المثبت بواسطة Inno Setup برمز خروج $installerExitCode." }
+          $installer = "dist/SDFBranchSystem-Setup-$env:SDF_VERSION.exe"
+          if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
+            throw "ملف المثبت المتوقع غير موجود: $installer"
+          }
+          if ((Get-Item -LiteralPath $installer).Length -le 0) {
+            throw "ملف المثبت الناتج فارغ."
+          }
+
+      - name: توليد بصمات SHA-256 وبيانات البناء
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg/dist"
+          $manifest = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg/ci-logs/SHA256SUMS.txt"
+          $portableDir = Join-Path $dist "SDFBranchSystem"
+          $portableExe = Join-Path $portableDir "SDFBranchSystem.exe"
+          $installer = Join-Path $dist "SDFBranchSystem-Setup-$env:SDF_VERSION.exe"
+          foreach ($file in @($portableExe, $installer)) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "ملف مطلوب لحساب SHA-256 غير موجود: $file" }
+          }
+          $filesToHash = @(Get-ChildItem -LiteralPath $portableDir -File -Recurse) + @(Get-Item -LiteralPath $installer)
+          if ($filesToHash.Count -lt 2) { throw "لم تُعثر على ملفات كافية لإنشاء بيان SHA-256." }
+          $lines = @()
+          foreach ($file in ($filesToHash | Sort-Object FullName)) {
+            $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            $relative = [System.IO.Path]::GetRelativePath($dist, $file.FullName).Replace('\', '/')
+            $lines += "$hash  $relative"
+          }
+          $lines | Set-Content -LiteralPath $manifest -Encoding utf8
+          @(
+            "version=$env:SDF_VERSION",
+            "commit=$env:GITHUB_SHA",
+            "ref=$env:GITHUB_REF",
+            "runner_os=$env:RUNNER_OS",
+            "python=$(python --version 2>&1)"
+          ) | Set-Content -LiteralPath "sdf_pkg/ci-logs/build-metadata.txt" -Encoding utf8
+
+      - name: فحص المخرجات بحثًا عن ملفات بيانات أو أسرار غير متوقعة
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scanRoots = @("sdf_pkg/dist", "sdf_pkg/ci-logs")
+          $blockedExtensions = @(".db", ".sqlite", ".sqlite3", ".xlsx", ".xlsm", ".xls", ".pdf", ".env", ".pem", ".p12", ".pfx")
+          $unexpected = @()
+          foreach ($root in $scanRoots) {
+            if (Test-Path -LiteralPath $root) {
+              $unexpected += @(Get-ChildItem -LiteralPath $root -File -Recurse | Where-Object { $blockedExtensions -contains $_.Extension.ToLowerInvariant() -or $_.Name -in @("id_rsa", "id_ed25519", ".env") })
+            }
+          }
+          if ($unexpected.Count -gt 0) {
+            $unexpected | ForEach-Object { Write-Error "مخرج حساس غير متوقع: $($_.FullName)" }
+            throw "أوقف رفع artifacts بسبب ملفات بيانات/أسرار محتملة."
+          }
+          "artifact_privacy_scan=passed" | Set-Content -Path "sdf_pkg/ci-logs/artifact-privacy-scan.txt" -Encoding utf8
+
+      - name: فحص محتوى السجلات والمخرجات بحثًا عن أسرار شائعة
+        shell: pwsh
+        run: |
+          python sdf_pkg/tools/scan_artifacts.py sdf_pkg/dist sdf_pkg/ci-logs 2>&1 | Tee-Object -FilePath "sdf_pkg/ci-logs/content-secret-scan.log"
+          $scanExitCode = $LASTEXITCODE
+          "content_secret_scan_exit_code=$scanExitCode" | Set-Content -Path "sdf_pkg/ci-logs/content-secret-scan-exit-code.txt" -Encoding utf8
+          if ($scanExitCode -ne 0) { throw "فشل فحص محتوى artifacts؛ لن تُرفع المخرجات." }
+
+      - name: تجهيز أدوات فحص الاختصارات لوظيفة install-smoke
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "lnk-tools/tools" | Out-Null
+          New-Item -ItemType Directory -Force -Path "lnk-tools/tests/fixtures" | Out-Null
+          Copy-Item -LiteralPath "sdf_pkg/tools/lnk_shortcut.ps1" -Destination "lnk-tools/tools/"
+          Copy-Item -LiteralPath "sdf_pkg/tools/test_lnk_parser.ps1" -Destination "lnk-tools/tools/"
+          Copy-Item -LiteralPath "sdf_pkg/tests/fixtures/lnk" -Destination "lnk-tools/tests/fixtures/" -Recurse
+
+      - name: رفع أدوات فحص الاختصارات
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-LnkTools-${{ github.run_id }}
+          path: lnk-tools
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: رفع بيان البصمات
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-SHA256-${{ env.SDF_VERSION }}
+          path: sdf_pkg/ci-logs/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: رفع المثبت
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-Setup-${{ env.SDF_VERSION }}
+          path: sdf_pkg/dist/SDFBranchSystem-Setup-${{ env.SDF_VERSION }}.exe
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: رفع النسخة المحمولة
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-Portable-${{ env.SDF_VERSION }}
+          path: sdf_pkg/dist/SDFBranchSystem/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: جمع تحذيرات PyInstaller
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "sdf_pkg/ci-logs" | Out-Null
+          if (-not (Test-Path -LiteralPath "sdf_pkg/ci-logs/pytest-exit-code.txt")) {
+            "not_run_before_test_step" | Set-Content -Path "sdf_pkg/ci-logs/pytest-exit-code.txt" -Encoding utf8
+          }
+          if (-not (Test-Path -LiteralPath "sdf_pkg/ci-logs/process-exit-codes.txt")) {
+            "pyinstaller=not_run`ninno_setup=not_run" | Set-Content -Path "sdf_pkg/ci-logs/process-exit-codes.txt" -Encoding utf8
+          }
+          $warningFiles = @(Get-ChildItem -Path "sdf_pkg/build" -Filter "warn-*.txt" -Recurse -File -ErrorAction SilentlyContinue)
+          foreach ($file in $warningFiles) {
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path "sdf_pkg/ci-logs" $file.Name) -Force
+          }
+
+      - name: رفع سجلات التشخيص حتى عند الفشل
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-CI-Diagnostics-${{ github.run_id }}
+          path: sdf_pkg/ci-logs/**
+          if-no-files-found: warn
+          retention-days: 14
+
+
+  install-smoke:
+    name: اختبار التثبيت والتشغيل والإزالة
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      SDF_VERSION: ${{ needs.build.outputs.version }}
+    steps:
+      - name: إعداد Python لفحص قاعدة البيانات
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: إنشاء مجلد التشخيص
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "$env:GITHUB_WORKSPACE/ci-logs" | Out-Null
+          "install_smoke=not_run" | Set-Content -Path "$env:GITHUB_WORKSPACE/ci-logs/install-smoke-exit-code.txt" -Encoding utf8
+
+      - name: تنزيل المثبت المبني
+        uses: actions/download-artifact@v4
+        with:
+          name: SDFBranchSystem-Setup-${{ needs.build.outputs.version }}
+          path: ${{ runner.temp }}/sdf-installer
+
+      - name: تنزيل بيان SHA-256
+        uses: actions/download-artifact@v4
+        with:
+          name: SDFBranchSystem-SHA256-${{ needs.build.outputs.version }}
+          path: ${{ runner.temp }}/sdf-checksums
+
+      - name: تنزيل أدوات فحص الاختصارات
+        uses: actions/download-artifact@v4
+        with:
+          name: SDFBranchSystem-LnkTools-${{ github.run_id }}
+          path: ${{ runner.temp }}/sdf-lnk-tools
+
+      - name: اختبار محلّل اختصارات Shell Link (تركيبات اصطناعية)
+        shell: pwsh
+        run: |
+          $parserScript = Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/test_lnk_parser.ps1"
+          $fixturesDir = Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tests/fixtures/lnk"
+          pwsh -NoProfile -ExecutionPolicy Bypass -File $parserScript -FixturesDir $fixturesDir 2>&1 | Tee-Object -FilePath "ci-logs/lnk-parser-fixtures.log" -Append
+          if ($LASTEXITCODE -ne 0) { throw "فشل اختبار محلّل اختصارات Shell Link على التركيبات الاصطناعية." }
+
+      - name: تثبيت البرنامج والتحقق من التشغيل وقاعدة البيانات
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:GITHUB_WORKSPACE "ci-logs/install-smoke.log"
+          $installDir = Join-Path $env:RUNNER_TEMP "SDFBranchSystem-install"
+          $installer = Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP "sdf-installer") -Filter "SDFBranchSystem-Setup-$($env:SDF_VERSION).exe" -File -Recurse | Select-Object -First 1
+          if (-not $installer) { throw "تعذر العثور على المثبت الخاص بالإصدار $($env:SDF_VERSION)." }
+          $manifest = Join-Path $env:RUNNER_TEMP "sdf-checksums/SHA256SUMS.txt"
+          if (-not (Test-Path -LiteralPath $manifest -PathType Leaf)) { throw "ملف SHA256SUMS.txt غير موجود؛ أُوقف التثبيت." }
+          $manifestPattern = "  SDFBranchSystem-Setup-$([regex]::Escape($env:SDF_VERSION))\.exe$"
+          $manifestLine = Get-Content -LiteralPath $manifest | Where-Object { $_ -match $manifestPattern } | Select-Object -First 1
+          if (-not $manifestLine) { throw "لا توجد بصمة للمثبت الحالي في بيان SHA-256." }
+          $expectedHash = ($manifestLine -split '\s+', 2)[0].ToLowerInvariant()
+          $actualHash = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) { throw "فشل التحقق من SHA-256 للمثبت قبل التشغيل." }
+          "installer_sha256_verified=$actualHash" | Add-Content -LiteralPath $log -Encoding utf8
+          $installerLog = Join-Path $env:GITHUB_WORKSPACE "ci-logs/installer-inno.log"
+          $install = Start-Process -FilePath $installer.FullName -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/LOG=`"{0}`"" -f $installerLog),("/DIR=`"{0}`"" -f $installDir)) -Wait -PassThru
+          "installer_exit_code=$($install.ExitCode)" | Tee-Object -FilePath $log -Append
+          if ($install.ExitCode -ne 0) { throw "فشل التثبيت الصامت برمز $($install.ExitCode)." }
+          $exe = Join-Path $installDir "SDFBranchSystem.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "الملف التنفيذي غير موجود بعد التثبيت: $exe" }
+
+         
+          $programRoots = @(
+          (Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"),
+          (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
+          )
+
+          Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+          . (Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/lnk_shortcut.ps1")
+          $matchingShortcut = $false
+
+          foreach ($programRoot in $programRoots) {
+          if (-not (Test-Path -LiteralPath $programRoot -PathType Container)) {
+          continue
+          }
+
+          $shortcuts = @(
+          Get-ChildItem -LiteralPath $programRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue
+          )
+
+          foreach ($shortcutFile in $shortcuts) {
+          try {
+            $shortcutResolution = Resolve-LnkTarget $shortcutFile.FullName
+            if (Test-LnkTargetEquals $shortcutResolution.Target $exe) {
+                $matchingShortcut = $true
+                (Format-LnkResolution $shortcutFile.FullName $shortcutResolution) | Add-Content -LiteralPath $log -Encoding utf8
+                "shortcut_match=$($shortcutFile.FullName) method=$($shortcutResolution.Method)" | Add-Content -LiteralPath $log -Encoding utf8
+                break
+            }
+             }
+           catch {
+            # تجاهل الاختصار الذي يتعذر قراءته.
+          }
+          }
+
+          if ($matchingShortcut) {
+          break
+          }
+          }
+
+          if (-not $matchingShortcut) {
+          # تشخيص قبل الفشل: سجّل الاختصارات الموجودة فعليًا وأهدافها، حتى يُفرَّق في سجل واحد
+          # بين اختصار لم يُنشأ، واختصار خارج المسارين المفحوصين، واختلاف في الهدف.
+          "shortcut_diag_expected_exe=$exe" | Add-Content -LiteralPath $log -Encoding utf8
+          foreach ($diagRoot in $programRoots) {
+            "shortcut_diag_root=$diagRoot exists=$(Test-Path -LiteralPath $diagRoot -PathType Container)" | Add-Content -LiteralPath $log -Encoding utf8
+            if (Test-Path -LiteralPath $diagRoot -PathType Container) {
+              foreach ($diagFile in @(Get-ChildItem -LiteralPath $diagRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue)) {
+                $diagResolution = Resolve-LnkTarget $diagFile.FullName
+                "shortcut_diag_found=$($diagFile.FullName)" | Add-Content -LiteralPath $log -Encoding utf8
+                (Format-LnkResolution $diagFile.FullName $diagResolution) | Add-Content -LiteralPath $log -Encoding utf8
+                if ($diagResolution.Parsed -and $diagResolution.Parsed.StringData -and $diagResolution.Parsed.StringData.Count -gt 0) {
+                  $sd = $diagResolution.Parsed.StringData
+                  "shortcut_stringdata path=$($diagFile.FullName) name=[$($sd['name'])] relative_path=[$($sd['relative_path'])] working_dir=[$($sd['working_dir'])] icon_location=[$($sd['icon_location'])]" | Add-Content -LiteralPath $log -Encoding utf8
+                }
+              }
+            }
+          }
+          throw "لم يُعثر على اختصار قائمة ابدأ يشير إلى الملف التنفيذي المثبت في مساري المستخدم والنظام."
+          }
+
+
+          Remove-Item Env:SDF_DATA_DIR -ErrorAction SilentlyContinue
+          $process = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 8
+          $process.Refresh()
+          if ($process.HasExited) { throw "انتهت عملية التطبيق مبكرًا برمز $($process.ExitCode)، وقد يشير ذلك إلى فشل بدء التشغيل." }
+          Stop-Process -Id $process.Id -Force
+          Wait-Process -Id $process.Id -Timeout 10 -ErrorAction SilentlyContinue
+
+          $dataDir = Join-Path $env:LOCALAPPDATA "SDFBranchSystem"
+          $db = Join-Path $dataDir "sdf.db"
+          if (-not (Test-Path -LiteralPath $db -PathType Leaf)) { throw "لم تُنشأ قاعدة البيانات في LOCALAPPDATA المتوقع: $db" }
+          $checkScript = Join-Path $env:RUNNER_TEMP "check_sdf_db.py"
+          @'
+          import sqlite3, sys
+          path = sys.argv[1]
+          with sqlite3.connect(path) as conn:
+              result = conn.execute("PRAGMA quick_check").fetchone()[0]
+              tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+              required = {"users", "training_files"}
+              missing = required - tables
+              print(f"quick_check={result}; table_count={len(tables)}; missing_tables={sorted(missing)}")
+              if result != "ok" or missing:
+                  raise SystemExit(1)
+          '@ | Set-Content -LiteralPath $checkScript -Encoding utf8
+          python $checkScript $db 2>&1 | Tee-Object -FilePath $log -Append
+          if ($LASTEXITCODE -ne 0) { throw "فشل فحص سلامة قاعدة البيانات." }
+          "launch=alive_after_8s; database=ok; data_dir=$dataDir" | Add-Content -LiteralPath $log -Encoding utf8
+          "checks_passed_uninstall_pending" | Set-Content -Path "$env:GITHUB_WORKSPACE/ci-logs/install-smoke-exit-code.txt" -Encoding utf8
+
+      - name: إزالة البرنامج والتحقق من بقاء البيانات
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $log = Join-Path $env:GITHUB_WORKSPACE "ci-logs/install-smoke.log"
+          if (-not (Test-Path -LiteralPath $log)) { New-Item -ItemType File -Force -Path $log | Out-Null }
+          $statusFile = Join-Path $env:GITHUB_WORKSPACE "ci-logs/install-smoke-exit-code.txt"
+          $priorStatus = if (Test-Path -LiteralPath $statusFile) { (Get-Content -LiteralPath $statusFile -Raw).Trim() } else { "not_run" }
+          "install_smoke=1" | Set-Content -Path $statusFile -Encoding utf8
+          $installDir = Join-Path $env:RUNNER_TEMP "SDFBranchSystem-install"
+          # Defensive cleanup: terminate any process whose executable is inside this test install.
+          $installPrefix = [System.IO.Path]::GetFullPath($installDir) + [System.IO.Path]::DirectorySeparatorChar
+          $leftoverProcesses = @(Get-Process -Name "SDFBranchSystem" -ErrorAction SilentlyContinue | Where-Object {
+            try { $_.Path -and [System.IO.Path]::GetFullPath($_.Path).StartsWith($installPrefix, [System.StringComparison]::OrdinalIgnoreCase) } catch { $false }
+          })
+          foreach ($leftover in $leftoverProcesses) {
+            "cleanup_stopping_pid=$($leftover.Id)" | Add-Content -LiteralPath $log -Encoding utf8
+            Stop-Process -Id $leftover.Id -Force -ErrorAction SilentlyContinue
+          }
+          if ($leftoverProcesses.Count -gt 0) { Start-Sleep -Seconds 2 }
+          $uninstaller = Join-Path $installDir "unins000.exe"
+          $uninstallSucceeded = $false
+          if (Test-Path -LiteralPath $uninstaller -PathType Leaf) {
+            $uninstallerLog = Join-Path $env:GITHUB_WORKSPACE "ci-logs/uninstaller-inno.log"
+            $uninstall = Start-Process -FilePath $uninstaller -ArgumentList @('/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',("/LOG=`"{0}`"" -f $uninstallerLog)) -Wait -PassThru
+            "uninstaller_exit_code=$($uninstall.ExitCode)" | Add-Content -LiteralPath $log -Encoding utf8
+            if ($uninstall.ExitCode -ne 0) { throw "فشلت إزالة التثبيت برمز $($uninstall.ExitCode)." }
+            if (Test-Path -LiteralPath (Join-Path $installDir "SDFBranchSystem.exe")) { throw "بقي الملف التنفيذي بعد إزالة التثبيت." }
+            
+            $programRoots = @(
+            (Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs"),
+            (Join-Path $env:ProgramData "Microsoft/Windows/Start Menu/Programs")
+            )
+
+            Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+            . (Join-Path $env:RUNNER_TEMP "sdf-lnk-tools/tools/lnk_shortcut.ps1")
+            $installedExe = Join-Path $installDir "SDFBranchSystem.exe"
+            $expectedStartMenuLnk = Join-Path $env:APPDATA "Microsoft/Windows/Start Menu/Programs/نظام إدارة ومراجعة ملفات البرامج التدريبية/نظام إدارة ومراجعة ملفات البرامج التدريبية.lnk"
+
+            foreach ($programRoot in $programRoots) {
+            if (-not (Test-Path -LiteralPath $programRoot -PathType Container)) {
+            continue
+            }
+
+            $shortcuts = @(
+            Get-ChildItem -LiteralPath $programRoot -Filter "*.lnk" -File -Recurse -ErrorAction SilentlyContinue
+           )
+
+           foreach ($shortcutFile in $shortcuts) {
+           try {
+            if ((Test-LnkTargetEquals (Resolve-LnkTarget $shortcutFile.FullName).Target $installedExe) -or ($shortcutFile.FullName -ieq $expectedStartMenuLnk)) {
+                throw "بقي اختصار قائمة ابدأ بعد إزالة التثبيت: $($shortcutFile.FullName)"
+            }
+            }
+            catch {
+            if ($_.Exception.Message -like "بقي اختصار قائمة ابدأ*") {
+                throw
+            }
+            }
+            }
+            }
+
+            $uninstallSucceeded = $true
+          } else {
+            "uninstaller=not_found; uninstall check failed" | Add-Content -LiteralPath $log -Encoding utf8
+          }
+          $db = Join-Path $env:LOCALAPPDATA "SDFBranchSystem/sdf.db"
+          $checkScript = Join-Path $env:RUNNER_TEMP "check_sdf_db.py"
+          $dbIntegrityOk = $false
+          if ((Test-Path -LiteralPath $db -PathType Leaf) -and (Test-Path -LiteralPath $checkScript -PathType Leaf)) {
+            python $checkScript $db 2>&1 | Tee-Object -FilePath $log -Append
+            $dbIntegrityOk = ($LASTEXITCODE -eq 0)
+          }
+          if ($uninstallSucceeded -and $dbIntegrityOk -and (Test-Path -LiteralPath $db -PathType Leaf) -and $priorStatus -eq "checks_passed_uninstall_pending") {
+            "data_retained_after_uninstall=true" | Add-Content -LiteralPath $log -Encoding utf8
+            "install_smoke=0" | Set-Content -Path $statusFile -Encoding utf8
+          } else {
+            "data_retained_after_uninstall=$([bool](Test-Path -LiteralPath $db -PathType Leaf)); prior_status=$priorStatus" | Add-Content -LiteralPath $log -Encoding utf8
+            "data_retained_detail=db_exists=$([bool](Test-Path -LiteralPath $db -PathType Leaf)); db_integrity_ok=$dbIntegrityOk; uninstall_succeeded=$uninstallSucceeded; prior_status=$priorStatus" | Add-Content -LiteralPath $log -Encoding utf8
+            "install_smoke=1" | Set-Content -Path $statusFile -Encoding utf8
+            if ($priorStatus -ne "checks_passed_uninstall_pending") { throw "لم تكتمل فحوصات التثبيت والتشغيل قبل مرحلة الإزالة؛ راجع install-smoke.log." }
+            throw "قاعدة بيانات المستخدم لم تبقَ بعد إزالة التثبيت."
+          }
+
+      - name: رفع سجلات install-smoke حتى عند الفشل
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-Install-Smoke-Diagnostics-${{ github.run_id }}
+          path: ci-logs/**
+          if-no-files-found: warn
+          retention-days: 14
