@@ -184,7 +184,7 @@ jobs:
           $env:QT_QPA_PLATFORM = "windows"
           foreach ($f in @("1.0", "1.25", "1.5")) {
             $env:QT_SCALE_FACTOR = $f
-            python sdf_pkg/tools/render_probe.py sdf_pkg/render-probe 2>&1 | Tee-Object -FilePath "sdf_pkg/render-probe/log_$f.txt" -Append
+            python sdf_pkg/tools/render_probe3.py sdf_pkg/render-probe 2>&1 | Tee-Object -FilePath "sdf_pkg/render-probe/log_$f.txt" -Append
           }
 
       - name: رفع صور المسبار
