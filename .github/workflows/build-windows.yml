@@ -176,6 +176,26 @@ jobs:
           "pytest_exit_code=$testExitCode" | Set-Content -Path "sdf_pkg/ci-logs/pytest-exit-code.txt" -Encoding utf8
           if ($testExitCode -ne 0) { throw "فشلت الاختبارات برمز خروج $testExitCode؛ أُوقف البناء مع حفظ السجل." }
 
+      - name: مسبار تصيير Windows (تشخيص قص الحروف)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $env:PYTHONPATH = Join-Path $env:GITHUB_WORKSPACE "sdf_pkg/src"
+          $env:QT_QPA_PLATFORM = "windows"
+          foreach ($f in @("1.0", "1.25", "1.5")) {
+            $env:QT_SCALE_FACTOR = $f
+            python sdf_pkg/tools/render_probe.py sdf_pkg/render-probe 2>&1 | Tee-Object -FilePath "sdf_pkg/render-probe/log_$f.txt" -Append
+          }
+
+      - name: رفع صور المسبار
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: SDFBranchSystem-RenderProbe-${{ github.run_id }}
+          path: sdf_pkg/render-probe
+          if-no-files-found: ignore
+          retention-days: 14
+
       - name: بناء النسخة المحمولة
         shell: pwsh
         working-directory: sdf_pkg
